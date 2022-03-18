@@ -51,7 +51,7 @@ Installation is only needed if you wish to host a version of this bot yourself.
     pip install requests-toolbelt
    ```
    
-3. The following Environment variables are required for this demo, set with the appropriate values (see the Environment Variables section below for more details):
+3. The following Environment variables are required for this demo, set with the appropriate values (see the Environment Variables section below for more details).  You can copy these into a file called ```.env``` in the root directory before updating the appropriate values.
       ```
       MY_BOT_ID=<PERSON_ID_OF_BOT>
       MY_BOT_TOKEN=<BOT_ACCESS_TOKEN>
@@ -69,7 +69,6 @@ Installation is only needed if you wish to host a version of this bot yourself.
 
       MY_MONGO_URI=mongodb+srv://<USER>:<PASSWORD>@<YOUR_CLUSTER_HOSTNAME>/useractivity?retryWrites=true&w=majority
       MY_MONGO_DB=useractivity
-
       ```
 4. Create the Webhooks (see below).
 5. Start the server with python 3.8 or above:
