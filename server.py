@@ -3,6 +3,7 @@
 from inspect import trace
 import json
 import os
+import pytz
 import traceback
 
 from lib.mongo_db_controller import UserDB
@@ -19,6 +20,8 @@ from lib.settings import Settings
 from handlers.base import BaseHandler
 from handlers.oauth import OAuthHandler
 
+from datetime import datetime
+from dateutil import parser
 from tornado.options import define, options, parse_command_line
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest, HTTPError
 from threading import Thread
@@ -52,23 +55,36 @@ class MainHandler(BaseHandler):
                     print("MainHandler Webhook Received:")
                     print(webhook)
                     message = yield self.application.settings['spark'].get_with_retries_v2('{0}/messages/{1}'.format(Settings.api_url, webhook['data']['id']))
-                    command = message.body.get('text')
-                    #print(command)
+                    command = message.body.get('text','').lower().strip()
+                    print('command:{0}'.format(command))
                     #print(ActiveThreads.threads)
+                    reply_msg = ""
                     if command.startswith('login'):
                         reply_msg = self.login_msg()
-                    elif command.startswith('all') or command.startswith('inactive'):
+                    elif command.startswith('all') or command.startswith('inactive') or command.startswith('pending') or command.startswith('invitepending'):
                         user_t = ActiveThreads.threads.get(webhook['actorId'])
                         if user_t == None or not user_t['thread'].is_alive():
                             user_token = self.application.settings['db'].get_token(webhook['actorId'])
                             if user_token != None:
+                                days_old = None
                                 filter = "all"
                                 if command.startswith('inactive'):
                                     filter = "inactive"
-                                t = Thread(target=self.list_users, args=[user_token, webhook['actorId'], filter], daemon=True)
-                                t.start()
-                                ActiveThreads.threads.update({webhook['actorId']: {"thread": t, "user_count":0}})
-                                reply_msg = "A user activity report is being generated and will be sent to you as a .csv attachment to you by this bot as soon as it's complete."
+                                elif command.startswith('invitepending') or command.startswith('pending'):
+                                    filter = "pending"
+                                    precommand, postcommand = command.split('pending')
+                                    try:
+                                        days_old = int(postcommand)
+                                    except Exception as e:
+                                        reply_msg = '```pending``` command should be in the format ```pending N``` where ```N``` is the minimum number of days old an "unactivated" account must be in order to be included in the report. For example:  \n'
+                                        reply_msg += '```pending 90```  \n'
+                                        reply_msg += 'You provided:  \n'
+                                        reply_msg += '```{0}```'.format(command)
+                                if reply_msg == "":
+                                    t = Thread(target=self.list_users, args=[user_token, webhook['actorId'], filter], kwargs={"days_old":days_old}, daemon=True)
+                                    t.start()
+                                    ActiveThreads.threads.update({webhook['actorId']: {"thread": t, "user_count":0}})
+                                    reply_msg = "A user activity report is being generated and will be sent to you as a .csv attachment to you by this bot as soon as it's complete."
                             else:
                                 reply_msg = "You are not logged in.  \n"
                                 reply_msg += self.login_msg()
@@ -93,6 +109,8 @@ class MainHandler(BaseHandler):
         msg += "Returns a .csv file with the ```lastActivity``` of all users in your organization.\n\n"
         msg += "**inactive** - "
         msg += "Returns a .csv file with the ```lastActivity``` of users in your organization whose status is ```inactive``` or ```unknown```.\n\n"
+        msg += "**pending** N - "
+        msg += "Returns a .csv file of users in your organization whose ```invitePending``` state is ```true``` (never logged in) and whose accounts were created more than N days ago.\n\n"
         msg += "**login** - "
         msg += "Authenticates to this application.  Required in order to retrieve the activity status of users in your org.\n\n"
         #msg += "You can find a walkthrough for this demo, along with the code at: https://github.com/WXSD-Sales/APMBot  \n"
@@ -100,12 +118,16 @@ class MainHandler(BaseHandler):
         return msg
 
 
-    def list_users(self, user_token, user_id, filter):
+    def list_users(self, user_token, user_id, filter, days_old=None):
         try:
             url = '{0}/people?max=500'.format(Settings.api_url)
             filename = "{0}.csv".format(user_id)
             wrote_data = False
-            self.write_headers(filename)
+            if filter == "pending":
+                print('days_old:{0}'.format(days_old))
+                self.write_pending_headers(filename)
+            else:
+                self.write_headers(filename)
             while url != None:
                 people = Spark(user_token).get_with_retries_std(url)
                 UserDB.db.update_expire_date(user_id)
@@ -114,7 +136,7 @@ class MainHandler(BaseHandler):
                     if ActiveThreads.threads.get(user_id):
                         ActiveThreads.threads[user_id]["user_count"] += len(items)
                     wrote_data = True
-                    self.write_users(filename, items, filter)
+                    self.write_users(filename, items, filter, days_old)
                 url = people.headers.get('Link')
                 if url != None:
                     extra, url = url.split("<")
@@ -134,16 +156,30 @@ class MainHandler(BaseHandler):
         with open(filename, 'w') as f:
             f.write('Email,LastActivity,Status\n')
 
-    def write_users(self, filename, items, filter):
+    def write_pending_headers(self, filename):
+        with open(filename, 'w') as f:
+            f.write('Email,Created,Age (in Days),InvitePending\n')
+
+    def write_users(self, filename, items, filter, days_old):
+        now = datetime.now(pytz.utc)
         try:
             for item in items:
+                item_email = item.get('emails', [None])[0]
                 if filter == "all" or (filter == "inactive" and item.get('status') in ["inactive", "pending", "unknown"]):
-                    self.write_user(filename, item)
+                    self.write_user(filename, [item_email, str(item.get('lastActivity')), str(item.get('status'))])
+                elif filter == "pending" and item.get('invitePending'):
+                    try:
+                        created_datetime = parser.isoparse(item.get('created'))
+                        days_age = (now - created_datetime).days
+                        if days_old in [None, 0] or days_age > days_old:
+                            self.write_user(filename, [item_email, str(item.get('created')), str(days_age), str(item.get('invitePending'))])
+                    except Exception as e:
+                        traceback.print_exc()
         except Exception as e:
             traceback.print_exc()
 
-    def write_user(self, filename, item):
-        write_str = "{},{},{}\n".format(item.get('emails', [None])[0], item.get('lastActivity'), item.get('status'))
+    def write_user(self, filename, items):
+        write_str = ",".join(items) + "\n"
         with open(filename, 'a') as f:
             f.write(write_str)
 
